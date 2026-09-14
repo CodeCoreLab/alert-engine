@@ -13,6 +13,38 @@ from alert_engine.alert_scoring import AlertScorer
 from alert_engine.escalation import EscalationPolicy
 
 
+def _cron_matches(expr: str, current_minute: int, current_hour: int) -> bool:
+    """极简 cron 匹配：仅支持 minute 和 hour 字段（5 段式前两位）。"""
+    parts = expr.strip().split()
+    if len(parts) < 2:
+        return False
+    minute_part, hour_part = parts[0], parts[1]
+    return _field_matches(minute_part, current_minute) and _field_matches(hour_part, current_hour)
+
+
+def _field_matches(field: str, value: int) -> bool:
+    field = field.strip()
+    if field == "*":
+        return True
+    if "," in field:
+        return any(_field_matches(f.strip(), value) for f in field.split(","))
+    if "/" in field:
+        base, step = field.split("/", 1)
+        base = base.strip() or "*"
+        step = int(step.strip())
+        if base == "*":
+            return value % step == 0
+        values = [int(x) for x in base.split("-")]
+        if len(values) == 1:
+            return values[0] % step == 0 and value == values[0]
+        start, end = values
+        return start <= value <= end and (value - start) % step == 0
+    if "-" in field:
+        start, end = (int(x.strip()) for x in field.split("-", 1))
+        return start <= value <= end
+    return int(field) == value
+
+
 @dataclass
 class PipelineResult:
     """单条告警经管线处理后的结果"""
@@ -55,6 +87,7 @@ class AlertEngine:
         self._dependency_map: Dict[str, str] = {}  # parent -> child
         self._baselines: Dict[str, tuple[float, float]] = {}  # key -> (mean, std)
         self._seen_fingerprints: set = set()
+        self._fingerprint_ts: Dict[str, float] = {}
         self._last_fire: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
@@ -126,6 +159,8 @@ class AlertEngine:
         score_result = self.scorer.score(alert)
         action = self._determine_action(score_result)
 
+        self._cleanup_expired(alert.timestamp)
+
         return PipelineResult(
             alert=alert,
             passed=True,
@@ -134,6 +169,21 @@ class AlertEngine:
             action=action,
             stages_passed=stages,
         )
+
+    def _cleanup_expired(self, now: float):
+        """清理过期指纹、基线快照和已 resolved 的 incidents。"""
+        dedup_ttl = 600
+        expired = [fp for fp, ts in self._fingerprint_ts.items() if now - ts > dedup_ttl]
+        for fp in expired:
+            self._seen_fingerprints.discard(fp)
+            del self._fingerprint_ts[fp]
+        for key in list(self._last_fire.keys()):
+            if now - self._last_fire[key] > 1800:
+                del self._last_fire[key]
+        self.aggregator._active_incidents = {
+            k: v for k, v in self.aggregator._active_incidents.items()
+            if not v.resolved
+        }
 
     def run_pipeline(self, alerts: List[Alert]) -> List[PipelineResult]:
         """批量处理"""
@@ -165,6 +215,7 @@ class AlertEngine:
         if fp in self._seen_fingerprints:
             return False
         self._seen_fingerprints.add(fp)
+        self._fingerprint_ts[fp] = alert.timestamp
         return True
 
     def _stage_silence(self, alert: Alert) -> bool:
@@ -178,26 +229,47 @@ class AlertEngine:
         return False
 
     def _stage_mute_timing(self, alert: Alert) -> bool:
-        # 简化实现：实际应解析 cron 表达式
+        """周期条件静默：基于 cron 表达式的分钟/小时匹配。"""
+        from datetime import datetime
+        now_dt = datetime.fromtimestamp(alert.timestamp)
+        current_minute = now_dt.minute
+        current_hour = now_dt.hour
+        for rule in self._mute_timing_rules:
+            cron_expr = rule.get("cron", "")
+            match = rule.get("match", {})
+            if not cron_expr or not match:
+                continue
+            if not _cron_matches(cron_expr, current_minute, current_hour):
+                continue
+            if all(alert.labels.get(k) == v for k, v in match.items()):
+                return True
         return False
 
     def _stage_dependency_inhibit(self, alert: Alert) -> bool:
+        """根因压制：上游未 resolved 时，抑制下游告警。"""
         parent = self._dependency_map.get(alert.service)
-        if parent and parent in self.aggregator._active_incidents:
-            return True
-        return False
+        if not parent:
+            return False
+        active_parents = [
+            inc for inc in self.aggregator._active_incidents.values()
+            if not inc.resolved and inc.root_service == parent
+        ]
+        return bool(active_parents)
 
     def _stage_inhibit(self, alert: Alert) -> bool:
-        # 高等级告警触发后，抑制同类型低等级
+        """级别抑制：同名告警存在未 resolved 的高等级时，抑制低等级。"""
         rank = {"p0": 0, "p1": 1, "p2": 2, "p3": 3, "info": 4}
         current_rank = rank.get(alert.severity, 4)
         for inc in self.aggregator._active_incidents.values():
+            if inc.resolved:
+                continue
             for a in inc.alerts:
                 if a.alert_name == alert.alert_name and rank.get(a.severity, 4) < current_rank:
                     return True
         return False
 
     def _stage_baseline(self, alert: Alert) -> bool:
+        """3σ 基线预判：支持 EWMA 动态基线更新。"""
         key = f"{alert.service}:{alert.alert_name}"
         if key in self._baselines:
             mean, std = self._baselines[key]
@@ -205,6 +277,15 @@ class AlertEngine:
                 z = abs(alert.value - mean) / std
                 if z < 3.0:
                     return False
+        # EWMA 更新基线
+        alpha = 0.1
+        if key in self._baselines:
+            prev_mean, prev_std = self._baselines[key]
+            new_mean = alpha * alert.value + (1 - alpha) * prev_mean
+            new_std = abs(alert.value - new_mean) * alpha + (1 - alpha) * prev_std
+            self._baselines[key] = (new_mean, new_std if new_std > 0.1 else prev_std)
+        else:
+            self._baselines[key] = (alert.value, 1.0)
         return True
 
     def _determine_action(self, score_result: AlertScore) -> str:

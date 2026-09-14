@@ -4,9 +4,7 @@ import time
 
 import pytest
 
-from alert_engine.aggregation import Alert, Incident, TimeWindowAggregator
-from alert_engine.alert_scoring import AlertScorer
-from alert_engine.escalation import EscalationPolicy
+from alert_engine.types import Alert, Incident, TimeWindowAggregator, AlertScorer
 from alert_engine.engine import AlertEngine, PipelineResult
 from alert_engine.symptom_router import SymptomRouter
 
@@ -119,3 +117,96 @@ class TestSymptomRouter:
         router = SymptomRouter.default()
         group = router.route("UnknownAlertXYZ", {}, "p3")
         assert group is None
+
+
+class TestMuteTiming:
+    def test_cron_matches(self):
+        engine = AlertEngine()
+        engine.add_mute_timing({
+            "cron": "0 2 * * *",
+            "match": {"service": "backup"},
+        })
+        # 02:00 的告警应被静默
+        alert = Alert(id="1", alert_name="BackupFail", service="backup", cluster="prod",
+                      severity="p3", timestamp=__import__("datetime").datetime(2025, 1, 1, 2, 0).timestamp())
+        r = engine.feed(alert)
+        assert not r.passed
+        assert r.suppressed_by == "mute_timing"
+
+    def test_cron_no_match_wrong_time(self):
+        engine = AlertEngine()
+        engine.add_mute_timing({
+            "cron": "0 2 * * *",
+            "match": {"service": "backup"},
+        })
+        # 03:00 的告警应通过
+        alert = Alert(id="1", alert_name="BackupFail", service="backup", cluster="prod",
+                      severity="p3", timestamp=__import__("datetime").datetime(2025, 1, 1, 3, 0).timestamp())
+        r = engine.feed(alert)
+        assert r.passed
+
+
+class TestBaselineEWMA:
+    def test_baseline_ewma_updates(self):
+        engine = AlertEngine()
+        engine.set_baseline("api:HighCPU", mean=70.0, std=15.0)
+        # 80 在 3σ 内（(80-70)/15=0.67<3），应通过并更新基线
+        a = Alert(id="1", alert_name="HighCPU", service="api", cluster="prod",
+                  severity="p1", timestamp=time.time(), value=80.0)
+        r = engine.feed(a)
+        assert r.passed
+        # 基线均值应向 80 靠近
+        mean, std = engine._baselines["api:HighCPU"]
+        assert mean > 70.0
+
+
+class TestDependencyInhibitResolved:
+    def test_resolved_parent_no_inhibit(self):
+        engine = AlertEngine()
+        engine.set_dependency("api-gateway", "db-primary")
+        now = time.time()
+        # 先喂入 parent，创建 incident
+        parent = Alert(id="p1", alert_name="DBDown", service="db-primary", cluster="prod",
+                       severity="p0", timestamp=now)
+        engine.feed(parent)
+        # 手动 resolve parent incident
+        for inc in engine.aggregator._active_incidents.values():
+            if inc.root_service == "db-primary":
+                inc.resolved = True
+                break
+        # 现在喂入 child，不应被抑制
+        child = Alert(id="c1", alert_name="DBDown", service="api-gateway", cluster="prod",
+                      severity="p1", timestamp=now + 10)
+        r = engine.feed(child)
+        assert r.passed
+
+
+class TestCleanupExpired:
+    def test_cleanup_removes_resolved_incidents(self):
+        engine = AlertEngine(window_seconds=1)
+        now = time.time()
+        a = Alert(id="1", alert_name="x", service="s", cluster="c",
+                  severity="p1", timestamp=now)
+        engine.feed(a)
+        # 强制 resolve
+        for inc in engine.aggregator._active_incidents.values():
+            inc.resolved = True
+        # 再喂一条触发清理
+        b = Alert(id="2", alert_name="y", service="s2", cluster="c",
+                  severity="p1", timestamp=now + 2)
+        engine.feed(b)
+        assert all(not inc.resolved for inc in engine.aggregator._active_incidents.values())
+
+    def test_cleanup_removes_old_fingerprints(self):
+        engine = AlertEngine()
+        now = time.time()
+        a = Alert(id="1", alert_name="z", service="s", cluster="c",
+                  severity="p1", timestamp=now)
+        engine.feed(a)
+        assert len(engine._seen_fingerprints) > 0
+        # 推进时间超过 TTL
+        old_now = now + 601
+        b = Alert(id="2", alert_name="w", service="s2", cluster="c",
+                  severity="p1", timestamp=old_now)
+        engine.feed(b)
+        assert len(engine._fingerprint_ts) == 1  # 旧指纹已清理

@@ -1,31 +1,37 @@
 """
 alert-engine — 运维告警降噪引擎
 
-8 阶段管线：for_min → dedup → silence → mute_timing → dependency_inhibit → inhibit → baseline → event_bus
-
-快速开始:
-    from alert_engine import AlertEngine, Alert
-
+核心 API:
+    from alert_engine import AlertEngine, Alert, AlertScore
     engine = AlertEngine()
-    engine.feed(Alert(id="1", alert_name="HighCPU", service="api", severity="p1", timestamp=time.time()))
-    engine.run_pipeline()
+    result = engine.feed(alert)
 """
 
-from alert_engine.engine import AlertEngine
-from alert_engine.aggregation import Alert, Incident, TimeWindowAggregator
-from alert_engine.alert_scoring import AlertScorer, AlertScore
-from alert_engine.escalation import EscalationPolicy, EscalationContact
-from alert_engine.symptom_router import SymptomRouter
+from alert_engine.engine import AlertEngine, PipelineResult
+from alert_engine.types import Alert, Incident, TimeWindowAggregator, AlertScore, AlertScorer
+from alert_engine.adapters import (
+    BaseAdapter,
+    ZabbixAdapter,
+    N9eAdapter,
+    InfluxDBAdapter,
+    GenericJSONAdapter,
+)
+from alert_engine.memory import AlertMemory
 
 __all__ = [
     "AlertEngine",
+    "PipelineResult",
     "Alert",
     "Incident",
     "TimeWindowAggregator",
-    "AlertScorer",
     "AlertScore",
-    "EscalationPolicy",
-    "EscalationContact",
-    "SymptomRouter",
+    "AlertScorer",
+    "BaseAdapter",
+    "ZabbixAdapter",
+    "N9eAdapter",
+    "InfluxDBAdapter",
+    "GenericJSONAdapter",
+    "AlertMemory",
 ]
-__version__ = "0.1.0"
+
+__version__ = "0.2.0"
