@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
-
 
 # ---------------------------------------------------------------------------
 # 告警与 Incident
@@ -26,7 +24,7 @@ class Alert:
     cluster: str
     severity: str  # p0/p1/p2/p3
     timestamp: float  # epoch seconds
-    labels: Dict[str, str] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
     host: str = ""
     value: float = 0.0
 
@@ -37,7 +35,7 @@ class Incident:
     root_key: str
     root_service: str
     cluster: str
-    alerts: List[Alert] = field(default_factory=list)
+    alerts: list[Alert] = field(default_factory=list)
     created_at: float = 0.0
     resolved: bool = False
     resolved_at: float = 0.0
@@ -52,7 +50,7 @@ class Incident:
         return len(self.alerts)
 
     @property
-    def affected_services(self) -> Set[str]:
+    def affected_services(self) -> set[str]:
         return {a.service for a in self.alerts}
 
     @property
@@ -77,12 +75,12 @@ class TimeWindowAggregator:
 
     def __init__(self, window_seconds: int = 300):
         self.window_seconds = window_seconds
-        self._active_incidents: Dict[str, Incident] = {}
+        self._active_incidents: dict[str, Incident] = {}
 
     def _make_key(self, alert: Alert) -> str:
         return f"{alert.cluster}:{alert.service}"
 
-    def add_alert(self, alert: Alert) -> Optional[Incident]:
+    def add_alert(self, alert: Alert) -> Incident | None:
         key = self._make_key(alert)
         if key not in self._active_incidents:
             self._active_incidents[key] = Incident(
@@ -99,7 +97,7 @@ class TimeWindowAggregator:
             inc.resolved_at = alert.timestamp
         return inc
 
-    def get_active_incidents(self) -> List[Incident]:
+    def get_active_incidents(self) -> list[Incident]:
         now = time.time()
         active = []
         for inc in self._active_incidents.values():
@@ -130,6 +128,20 @@ SCORE_INCIDENT = 4.0
 SCORE_OBSERVE = 0.0
 
 
+def action_for_score(total_score: float) -> str:
+    """按分数判定动作 —— action 判定的唯一权威源。
+
+    评分器与管线都调这里，避免两处阈值漂移
+    （曾出现 scorer 用 7.0、engine 用 8.0，
+      导致同一条告警在评分器里是 immediate、在管线里是 incident）。
+    """
+    if total_score >= SCORE_IMMEDIATE:
+        return "immediate"
+    if total_score >= SCORE_INCIDENT:
+        return "incident"
+    return "observe"
+
+
 @dataclass
 class AlertScore:
     total_score: float
@@ -150,7 +162,7 @@ class AlertScorer:
             {"alert_name": {"resolution_rate": 0.7, "mttr_minutes": 15}}
     """
 
-    def __init__(self, historical_data: Optional[Dict[str, Dict]] = None):
+    def __init__(self, historical_data: dict[str, dict] | None = None):
         self.historical_data = historical_data or {}
 
     def score(self, alert: Alert) -> AlertScore:
@@ -179,12 +191,7 @@ class AlertScorer:
             + hist_score * 0.15
         ) * 10.0
 
-        if total >= SCORE_IMMEDIATE:
-            action = "immediate"
-        elif total >= SCORE_INCIDENT:
-            action = "incident"
-        else:
-            action = "observe"
+        action = action_for_score(total)
 
         confidence = min(sev_score + blast + baseline_score + hist_score, 1.0)
         return AlertScore(

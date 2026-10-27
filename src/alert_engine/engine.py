@@ -4,13 +4,21 @@ alert-engine — 8 阶段降噪管线主引擎
 
 from __future__ import annotations
 
-import time
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from alert_engine.aggregation import Alert, Incident, TimeWindowAggregator
-from alert_engine.alert_scoring import AlertScorer
 from alert_engine.escalation import EscalationPolicy
+from alert_engine.types import (
+    Alert,
+    AlertScore,
+    AlertScorer,
+    Incident,
+    TimeWindowAggregator,
+    action_for_score,
+)
+
+log = logging.getLogger(__name__)
 
 
 def _cron_matches(expr: str, current_minute: int, current_hour: int) -> bool:
@@ -50,11 +58,11 @@ class PipelineResult:
     """单条告警经管线处理后的结果"""
     alert: Alert
     passed: bool
-    incident: Optional[Incident] = None
-    score: Optional[float] = None
+    incident: Incident | None = None
+    score: float | None = None
     action: str = "drop"  # drop / observe / incident / immediate
-    stages_passed: List[str] = field(default_factory=list)
-    suppressed_by: Optional[str] = None
+    stages_passed: list[str] = field(default_factory=list)
+    suppressed_by: str | None = None
 
 
 class AlertEngine:
@@ -76,29 +84,30 @@ class AlertEngine:
         self,
         window_seconds: int = 300,
         dedup_window: int = 300,
-        escalation_policy: Optional[EscalationPolicy] = None,
-        scorer: Optional[AlertScorer] = None,
+        escalation_policy: EscalationPolicy | None = None,
+        scorer: AlertScorer | None = None,
     ):
         self.aggregator = TimeWindowAggregator(window_seconds=window_seconds)
         self.scorer = scorer or AlertScorer()
         self.escalation_policy = escalation_policy or EscalationPolicy.default()
-        self._silence_rules: List[Dict] = []
-        self._mute_timing_rules: List[Dict] = []
-        self._dependency_map: Dict[str, str] = {}  # parent -> child
-        self._baselines: Dict[str, tuple[float, float]] = {}  # key -> (mean, std)
+        self._silence_rules: list[dict] = []
+        self._mute_timing_rules: list[dict] = []
+        self._dependency_map: dict[str, str] = {}  # parent -> child
+        self._baselines: dict[str, tuple[float, float]] = {}  # key -> (mean, std)
         self._seen_fingerprints: set = set()
-        self._fingerprint_ts: Dict[str, float] = {}
-        self._last_fire: Dict[str, float] = {}
+        self._fingerprint_ts: dict[str, float] = {}
+        self._last_fire: dict[str, float] = {}
+        self._adapters: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # 配置
     # ------------------------------------------------------------------
 
-    def add_silence_rule(self, rule: Dict):
+    def add_silence_rule(self, rule: dict):
         """添加静默规则: {"match": {"service": "backup"}, "until": timestamp}"""
         self._silence_rules.append(rule)
 
-    def add_mute_timing(self, rule: Dict):
+    def add_mute_timing(self, rule: dict):
         """添加周期静默: {"cron": "0 2 * * *", "match": {...}}"""
         self._mute_timing_rules.append(rule)
 
@@ -116,7 +125,7 @@ class AlertEngine:
 
     def feed(self, alert: Alert) -> PipelineResult:
         """单条告警进管"""
-        stages: List[str] = []
+        stages: list[str] = []
 
         # Stage 0: for_min 防抖
         if not self._stage_for_min(alert):
@@ -185,13 +194,65 @@ class AlertEngine:
             if not v.resolved
         }
 
-    def run_pipeline(self, alerts: List[Alert]) -> List[PipelineResult]:
+    def run_pipeline(self, alerts: list[Alert]) -> list[PipelineResult]:
         """批量处理"""
         return [self.feed(a) for a in alerts]
 
-    def get_incidents(self) -> List[Incident]:
+    def get_incidents(self) -> list[Incident]:
         """获取当前活跃 Incident 列表"""
         return self.aggregator.get_active_incidents()
+
+    # ------------------------------------------------------------------
+    # Adapter 接入与运行
+    # ------------------------------------------------------------------
+
+    def register_adapter(self, name: str, adapter: Any) -> None:
+        """注册采集适配器。同名重复注册会覆盖旧的。"""
+        self._adapters[name] = adapter
+
+    def set_escalation_policy(self, policy: EscalationPolicy) -> None:
+        """替换升级策略。"""
+        self.escalation_policy = policy
+
+    def collect(self, since: float | None = None) -> list[Alert]:
+        """从所有已注册适配器拉取告警，按采集顺序合并。
+
+        单个适配器拉取失败不影响其余适配器 —— 一个数据源挂掉
+        不该让整轮采集归零。
+        """
+        alerts: list[Alert] = []
+        for name, adapter in self._adapters.items():
+            try:
+                got = adapter.fetch(since=since) or []
+            except Exception as e:
+                log.warning("适配器 %s 拉取失败: %s", name, e)
+                continue
+            alerts.extend(got)
+        return alerts
+
+    def run(self, since: float | None = None) -> list[PipelineResult]:
+        """拉取 → 过滤 → 聚合 → 评分，返回全部处理结果。
+
+        未注册任何适配器时返回空列表（不抛异常）——
+        调用方也可以直接用 feed() 手动喂告警。
+        """
+        return self.run_pipeline(self.collect(since=since))
+
+    def health(self) -> dict[str, Any]:
+        """健康检查：各适配器自检 + 管线统计。"""
+        adapters = {}
+        for name, adapter in self._adapters.items():
+            try:
+                adapters[name] = adapter.health()
+            except Exception as e:
+                adapters[name] = {"status": "error", "error": str(e)}
+        return {
+            "status": "ok" if not adapters or all(
+                a.get("status") == "ok" for a in adapters.values()
+            ) else "degraded",
+            "adapters": adapters,
+            "active_incidents": len(self.get_incidents()),
+        }
 
     # ------------------------------------------------------------------
     # 8 阶段实现
@@ -218,18 +279,41 @@ class AlertEngine:
         self._fingerprint_ts[fp] = alert.timestamp
         return True
 
+    def _match_rule(self, alert: Alert, match: dict) -> bool:
+        """判断告警是否命中规则的 match 条件。
+
+        match 的键既可指向 labels，也可指向告警顶层字段
+        （service / alert_name / cluster / severity / host）。
+        顶层字段优先 —— 同一键在两处都存在时以顶层为准，
+        避免「规则写 service 却被 labels 里的同名标签覆盖」。
+        """
+        if not match:
+            return False
+        for k, v in match.items():
+            if k in ("service", "alert_name", "cluster", "severity", "host"):
+                actual = getattr(alert, k, None)
+            else:
+                actual = (alert.labels or {}).get(k)
+            if actual != v:
+                return False
+        return True
+
     def _stage_silence(self, alert: Alert) -> bool:
         now = alert.timestamp
         for rule in self._silence_rules:
-            match = rule.get("match", {})
-            if all(alert.labels.get(k) == v for k, v in match.items()):
+            if self._match_rule(alert, rule.get("match", {})):
                 until = rule.get("until", 0)
                 if now < until:
                     return True
         return False
 
     def _stage_mute_timing(self, alert: Alert) -> bool:
-        """周期条件静默：基于 cron 表达式的分钟/小时匹配。"""
+        """周期条件静默：基于 cron 表达式的分钟/小时匹配。
+
+        时间基准用**服务器本地时区**（naive），与 crontab 语义一致 ——
+        "每天 02:00-05:00 静默" 指的是运维所在时区的 02:00。
+        改成 UTC 会让静默窗口整体偏移，使用者却毫无察觉。
+        """
         from datetime import datetime
         now_dt = datetime.fromtimestamp(alert.timestamp)
         current_minute = now_dt.minute
@@ -241,12 +325,21 @@ class AlertEngine:
                 continue
             if not _cron_matches(cron_expr, current_minute, current_hour):
                 continue
-            if all(alert.labels.get(k) == v for k, v in match.items()):
+            if self._match_rule(alert, match):
                 return True
         return False
 
     def _stage_dependency_inhibit(self, alert: Alert) -> bool:
-        """根因压制：上游未 resolved 时，抑制下游告警。"""
+        """根因压制：上游未 resolved 时，抑制下游告警。
+
+        P0 例外：最高级告警**永不被下游抑制**。
+        根因抑制按 service 匹配，不区分告警类型 ——
+        上游 service 出问题时，下游 service 的任何告警都会被压制，
+        包括与根因无关的独立故障（如上游 DB 抖动掩盖下游的 OOM）。
+        对 P0 而言，静默的代价（漏掉最高级故障）远大于收益（少一条噪音）。
+        """
+        if alert.severity == "p0":
+            return False
         parent = self._dependency_map.get(alert.service)
         if not parent:
             return False
@@ -269,28 +362,37 @@ class AlertEngine:
         return False
 
     def _stage_baseline(self, alert: Alert) -> bool:
-        """3σ 基线预判：支持 EWMA 动态基线更新。"""
+        """3σ 基线预判：支持 EWMA 动态基线更新。
+
+        语义（与 README 一致）：3σ **内**的样本属于正常波动 → 拦截不告警；
+        3σ 外才是异常 → 放行告警。
+
+        EWMA 更新时机：无论本次是否放行都要更新。
+        若只在放行时更新，基线将只被异常值污染（正常样本从不参与），
+        均值会持续漂移，基线随之失效。正常样本正是基线该学的东西。
+        """
         key = f"{alert.service}:{alert.alert_name}"
-        if key in self._baselines:
-            mean, std = self._baselines[key]
-            if std > 0:
-                z = abs(alert.value - mean) / std
-                if z < 3.0:
-                    return False
-        # EWMA 更新基线
         alpha = 0.1
         if key in self._baselines:
             prev_mean, prev_std = self._baselines[key]
+            if prev_std > 0:
+                z = abs(alert.value - prev_mean) / prev_std
+                within_3sigma = z < 3.0
+            else:
+                within_3sigma = False
+        else:
+            within_3sigma = False
+
+        # EWMA 更新（先更新，再判定用的是更新前的均值/标准差）
+        if key in self._baselines:
             new_mean = alpha * alert.value + (1 - alpha) * prev_mean
             new_std = abs(alert.value - new_mean) * alpha + (1 - alpha) * prev_std
             self._baselines[key] = (new_mean, new_std if new_std > 0.1 else prev_std)
         else:
             self._baselines[key] = (alert.value, 1.0)
-        return True
+
+        return not within_3sigma
 
     def _determine_action(self, score_result: AlertScore) -> str:
-        if score_result.total_score >= 8.0:
-            return "immediate"
-        if score_result.total_score >= 4.0:
-            return "incident"
-        return "observe"
+        """按评分判定动作。阈值统一走 types.action_for_score（唯一权威源）。"""
+        return action_for_score(score_result.total_score)

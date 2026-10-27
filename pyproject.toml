@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alert-engine"
-version = "0.1.0"
-description = "运维告警降噪引擎 — 8 阶段管线（去重/聚合/降噪/基线/升级）+ LLM 摘要"
+version = "0.3.0"
+description = "运维告警降噪引擎 — 8 阶段管线（去重/聚合/降噪/基线/升级）+ 评分与症状路由"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-authors = [{ name = "Codex Haha", email = "codex@example.com" }]
-keywords = ["alert", "ops", "noise-reduction", "incident", "escalation", "llm"]
+authors = [{ name = "CodeCoreLab" }]
+keywords = ["alert", "ops", "noise-reduction", "incident", "escalation", "sre"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -46,6 +46,23 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# 显式锁定规则集：ruff 默认规则集随版本变化（0.6 → 0.16 差异明显），
+# 不锁定则 CI 会出现"今天绿、升个 ruff 就红"的版本漂移。
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",    # 行长由 formatter 负责，ruff 与 black 容易打架
+    "B008",    # FastAPI/Click 的 Depends()/参数默认值是惯用写法
+    "SIM108",  # 三元表达式不一定比 if/else 清晰
+    "RUF001",  # 中文全角标点在中文项目里是常态
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里长字符串与大量 fixture 断言，宽松一点不影响正确性
+"tests/*" = ["E402", "B011"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

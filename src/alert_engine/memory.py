@@ -14,13 +14,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from alert_engine.types import Alert, AlertScore, Incident
-
+from alert_engine.types import Incident
 
 # ---------------------------------------------------------------------------
 # 数据模型
@@ -35,11 +34,11 @@ class AlertMemoryRecord:
     cluster: str
     severity: str
     passed: bool
-    suppressed_by: Optional[str]
-    score: Optional[float]
+    suppressed_by: str | None
+    score: float | None
     action: str
-    stages: List[str]
-    incident_key: Optional[str]
+    stages: list[str]
+    incident_key: str | None
     created_at: str = ""
 
 
@@ -91,10 +90,11 @@ class AlertMemory:
         with _get_conn(self.db_path) as c:
             c.executescript(_DEFAULT_SCHEMA)
 
-    def remember(self, result: Any, incident: Optional[Incident] = None) -> str:
+    def remember(self, result: Any, incident: Incident | None = None) -> str:
         """记录告警处理结果"""
         mem_id = f"alert_{int(time.time() * 1000)}_{result.alert.id}"
-        now = datetime.now().isoformat()
+        # 带时区信息，避免跨时区部署时 created_at 排序错乱 / 无法与 DB 默认值对齐
+        now = datetime.now().astimezone().isoformat()
         stages_json = json.dumps(result.stages_passed, ensure_ascii=False)
         incident_key = result.incident.root_key if result.incident else ""
         with _get_conn(self.db_path) as c:
@@ -121,7 +121,7 @@ class AlertMemory:
             )
         return mem_id
 
-    def recall(self, service: str = "", severity: str = "", limit: int = 50) -> List[Dict]:
+    def recall(self, service: str = "", severity: str = "", limit: int = 50) -> list[dict]:
         """查询历史告警记录"""
         sql = "SELECT * FROM alert_memories WHERE 1=1"
         params: list = []
@@ -136,7 +136,7 @@ class AlertMemory:
         with _get_conn(self.db_path) as c:
             return [dict(r) for r in c.execute(sql, params).fetchall()]
 
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         """统计信息"""
         with _get_conn(self.db_path) as c:
             total = c.execute("SELECT COUNT(*) FROM alert_memories").fetchone()[0]

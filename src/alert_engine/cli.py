@@ -15,11 +15,10 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from alert_engine.aggregation import Alert, TimeWindowAggregator
-from alert_engine.alert_scoring import AlertScorer
-from alert_engine.escalation import EscalationPolicy
 from alert_engine.engine import AlertEngine
+from alert_engine.escalation import EscalationPolicy
 from alert_engine.symptom_router import SymptomRouter
+from alert_engine.types import Alert, AlertScorer
 
 console = Console()
 
@@ -27,7 +26,6 @@ console = Console()
 @click.group()
 def cli():
     """alert-engine — 运维告警降噪引擎 CLI"""
-    pass
 
 
 @cli.command()
