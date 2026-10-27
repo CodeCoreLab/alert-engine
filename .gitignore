@@ -19,6 +19,7 @@ venv/
 .pytest_cache/
 htmlcov/
 .coverage
+.ruff_cache/
 
 # IDE
 .vscode/

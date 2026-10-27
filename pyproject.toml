@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,14 +7,19 @@ name = "alert-engine"
 version = "0.3.0"
 description = "运维告警降噪引擎 — 8 阶段管线（去重/聚合/降噪/基线/升级）+ 评分与症状路由"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+# PEP 639 写法：字符串 SPDX 标识。旧的 license = { text = ... } 已被 setuptools
+# 弃用（setuptools>=77 起告警），license-files 指向仓库内的 LICENSE 全文。
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "CodeCoreLab" }]
 keywords = ["alert", "ops", "noise-reduction", "incident", "escalation", "sre"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    # 注意：不再声明 "License :: OSI Approved :: Apache Software License" ——
+    # PEP 639 规定 license 表达式与 license classifiers 重复，setuptools>=77
+    # 会直接报 InvalidConfigError 导致构建失败。
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
